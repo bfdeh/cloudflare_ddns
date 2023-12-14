@@ -1,0 +1,13 @@
+[Unit]
+Description=Cloudflare DDNS service
+Wants=network.target
+After=network.target network.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/cloudflare_ddns
+ExecStart=/opt/cloudflare_ddns/cloudflare_ddns
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

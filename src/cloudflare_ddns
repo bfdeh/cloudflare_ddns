@@ -1,0 +1,282 @@
+#!/bin/bash
+
+DEF_CONF="$(dirname $0)/cloudflare_ddns.conf"
+
+function usage()
+{
+	cat << EOF >&2
+usage : $0 <options>
+options:
+	-t	API Token
+	-d	domain name
+	-r	record type, A or AAAA(default)
+	-p	enable DNS proxy, true(default) or false
+	-l	TTL in seconds, 1(default) for auto
+	-i	local network interface, e.g., eth0
+	-f	config file (default: $DEF_CONF)
+EOF
+}
+
+function error_msg()
+{
+	[ -n "$*" ] && echo "$@" >&2
+}
+
+function check_utils()
+{
+	local err=0
+
+	for t in $@; do
+		type $t > /dev/null 2>&1 || { 
+			error_msg "$t is not installed."
+			err=1
+		}
+	done
+
+	return $err
+}
+
+function domain_match()
+{
+	local domain=$1
+	local sub=$2
+
+	[ ${#sub} -lt ${#domain} ] && return 1
+	[ "$domain" == "$sub" ] && return 0
+	[ ".$domain" == "$(echo -n $sub | tail -c $((${#domain}+1)))" ] && return 0
+	return 1
+}
+
+function get_zone_id()
+{
+	local res success id name idx
+	local target=$1
+
+	res=$(curl -S -s --request GET --url https://api.cloudflare.com/client/v4/zones --header "Authorization: Bearer ${TOKEN}" --header "Content-Type: application/json")
+	[ $? -ne 0 ] && return 1
+
+	success=$(echo "$res" | jq .success)
+	if [ "$success" != "true" ]; then
+		error_msg "$res"
+		return 1
+	fi
+
+	idx=0
+	while true; do
+		eval name=$(echo "$res" | jq .result[$idx].name)
+		[ "null" = "$name" ] && break
+		domain_match $name $target && {
+			eval id=$(echo "$res" | jq .result[$idx].id)
+			echo $id
+			return 0
+		}
+		idx=$(($idx+1))
+	done
+	return 1
+}
+
+function get_record_id()
+{
+	local res idx success
+	local domain=$1
+
+	res=$(curl -S -s --request GET --url https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records --header "Content-Type: application/json" --header "Authorization: Bearer ${TOKEN}")
+	[ $? -ne 0 ] && return 1
+
+	success=$(echo "$res" | jq .success)
+	if [ "$success" != "true" ]; then
+		error_msg "$res"
+		return 1
+	fi
+
+	idx=0
+	while true; do
+		eval name=$(echo "$res" | jq .result[$idx].name)
+		[ "$domain" = "$name" ] && {
+			eval id=$(echo "$res" | jq .result[$idx].id)
+			echo $id
+			return 0
+		}
+		idx=$(($idx+1))
+	done
+	return 1
+}
+
+function update_record()
+{
+	local res success
+
+	res=$(curl -S -s --request PUT \
+		--url https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${RECORD_ID} \
+		--header "Content-Type: application/json" \
+		--header "Authorization: Bearer ${TOKEN}" \
+		--data "{
+			\"content\": \"$NEWIP\",
+			\"name\": \"$DOMAIN\",
+			\"proxied\": $PROXY,
+			\"type\": \"$RECORD_TYPE\",
+			\"comment\": \"\",
+			\"tags\": [],
+			\"ttl\": $TTL
+		}")
+
+	success=$(echo "$res" | jq .success)
+	if [ "$success" != "true" ]; then
+		error_msg "$res"
+		return 1
+	fi
+
+	echo "record updated, $DOMAIN $NEWIP proxy:$PROXY ttl:$TTL"
+	return 0
+}
+
+function get_interface_ip()
+{
+	local ip
+	local type=$1
+	local interface=$2
+	
+	if [ "$type" = "A" ]; then
+		ip=$(ip add ls $interface | grep "inet " | head -n1 | awk '{print $2}' | awk -F'/' '{print $1}')
+	else
+		ip=$(ip add ls $interface | grep "inet6.*mngtmpaddr" | head -n1 | awk '{print $2}' | awk -F'/' '{print $1}')
+	fi
+	
+	[ -z "$ip" ] && return 1
+	echo $ip
+	return 0
+}
+
+function error_sleep()
+{
+	local errcnt=$1
+	
+	if [ $errcnt -le 5 ]; then
+		sleep 60
+	elif [ $errcnt -le 10 ]; then
+		sleep 120
+	elif [ $errcnt -le 20 ]; then
+		sleep 300
+	elif [ $errcnt -le 30 ]; then
+		sleep 600
+	else
+		sleep 1200
+	fi
+}
+
+TOKEN=
+DOMAIN=
+PROXY=true
+RECORD_TYPE=AAAA
+INTERFACE=
+TTL=1
+
+ZONE_ID=
+RECORD_ID=
+OLDIP=
+NEWIP=
+ERRCNT=0
+
+check_utils jq curl grep awk head || exit 1
+
+#load default config file.
+[ -r "$DEF_CONF" ] && source "$DEF_CONF"
+
+while getopts "t:d:r:p:l:i:f:" opt; do
+	case $opt in
+		t)
+			TOKEN=$OPTARG
+			;;
+		d)
+			DOMAIN=$OPTARG
+			;;
+		r)
+			RECORD_TYPE=$OPTARG
+			;;
+		p)
+			PROXY=$OPTARG
+			;;
+		l)
+			TTL=$OPTARG
+			;;
+		i)
+			INTERFACE=$OPTARG
+			;;
+		f)
+			[ -r "$OPTARG" ] || {
+				error_msg "can't open $OPTARG"
+				exit 1
+			}
+			source "$OPTARG"
+			;;
+		?)
+			usage
+			exit 1
+			;;
+	esac
+done
+
+echo "INTERFACE=$INTERFACE"
+#echo "TOKEN=$TOKEN"
+echo "DOMAIN=$DOMAIN"
+echo "RECORD_TYPE=$RECORD_TYPE"
+echo "PROXY=$PROXY"
+echo "TTL=$TTL"
+
+[ -z "$INTERFACE" ] && error_msg "error: INTERFACE not set, use -i to set it." && exit 1
+[ -z "$TOKEN" ] && error_msg "error: TOKEN not set, use -t to set it." && exit 1
+[ -z "$DOMAIN" ] && error_msg "error: DOMAIN not set, use -d to set it." && exit 1
+[ -z "$RECORD_TYPE" ] && error_msg "error: RECORD_TYPE not set, use -r to set it." && exit 1
+[ -z "$PROXY" ] && error_msg "error: PROXY not set, use -p to set it." && exit 1
+[ -z "$TTL" ] && error_msg "error: TTL not set, use -l to set it." && exit 1
+
+while true; do
+
+	#get ip
+	while [ -z "$NEWIP" ]; do
+		NEWIP=$(get_interface_ip $RECORD_TYPE $INTERFACE) && break
+		sleep 10
+	done
+
+	#ip not change
+	[ "$OLDIP" = "$NEWIP" ] && {
+		sleep 60
+		continue
+	}
+
+	#get zone id
+	while [ -z "$ZONE_ID" ]; do
+		ZONE_ID=$(get_zone_id $DOMAIN) && break
+		ERRCNT=$(($ERRCNT+1))
+		error_sleep $ERRCNT
+	done
+	ERRCNT=0
+
+	#get record id
+	while [ -z "$RECORD_ID" ]; do
+		RECORD_ID=$(get_record_id $DOMAIN) && break
+		ERRCNT=$(($ERRCNT+1))
+		error_sleep $ERRCNT
+	done
+	ERRCNT=0
+	
+	#uppdate record
+	while [ $ERRCNT -le 5 ]; do
+		update_record && {
+			OLDIP=$NEWIP
+			ERRCNT=0
+			break
+		}
+		ERRCNT=$(($ERRCNT+1))
+		error_sleep $ERRCNT
+	done
+	if [ $ERRCNT -gt 5 ]; then
+		ZONE_ID=
+		RECORD_ID=
+	else
+		sleep 60
+	fi
+
+	NEWIP=
+
+done
