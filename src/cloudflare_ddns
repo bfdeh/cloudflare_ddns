@@ -233,7 +233,7 @@ echo "TTL=$TTL"
 while true; do
 
 	#get ip
-	while [ -z "$NEWIP" ]; do
+	while true; do
 		NEWIP=$(get_interface_ip $RECORD_TYPE $INTERFACE) && break
 		sleep 10
 	done
